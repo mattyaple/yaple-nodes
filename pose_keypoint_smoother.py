@@ -121,18 +121,61 @@ def _smooth_one_euro(coords, fps, min_cutoff, beta, d_cutoff=1.0):
 
 
 # ---------------------------------------------------------------------------
+# Seam stabilization weight
+# ---------------------------------------------------------------------------
+
+def _compute_seam_weight(n_frames, frame_window_size, seam_motion_frame,
+                         stabilize_radius, stabilize_strength):
+    """
+    Build a per-frame blend weight array that peaks at each window seam.
+
+    The seam is the hard stitch point in InfiniteTalk's output: the last frame
+    of window N meets the first new frame of window N+1.  The seam center sits
+    halfway between those two frames (frame_window_size - 0.5, then repeating
+    every stride frames).
+
+    Returns a (n_frames,) float array in [0, stabilize_strength].
+    """
+    stride = frame_window_size - seam_motion_frame
+    if stride <= 0:
+        return None
+
+    frame_indices = np.arange(n_frames, dtype=float)
+    seam_weight = np.zeros(n_frames, dtype=float)
+
+    # First seam: halfway between the last frame of window 1 and the first new
+    # frame of window 2 (frame_window_size - 1  →  frame_window_size).
+    seam_center = frame_window_size - 0.5
+    while seam_center < n_frames:
+        seam_weight += np.exp(
+            -0.5 * ((frame_indices - seam_center) / stabilize_radius) ** 2
+        )
+        seam_center += stride
+
+    return np.clip(seam_weight * stabilize_strength, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
 # Core smoothing logic over a list of per-frame keypoint arrays
 # ---------------------------------------------------------------------------
 
-def _smooth_keypoints(kps_frames, method, sigma, window_size, alpha, min_cutoff, beta, fps):
+def _smooth_keypoints(kps_frames, method, sigma, window_size, alpha,
+                      min_cutoff, beta, fps,
+                      seam_weight=None, stabilize_sigma=8.0):
     """
     Smooth keypoints across N frames.
 
-    kps_frames : list of N items; each item is a flat list of floats
-                 [x1, y1, c1, x2, y2, c2, ...] as produced by compress_keypoints(),
-                 or None for frames where this person/part is absent.
-    Returns    : list of N items in the same flat-float format, x/y smoothed.
-                 Confidence values and undetected keypoints are preserved unchanged.
+    kps_frames     : list of N items; each item is a flat list of floats
+                     [x1, y1, c1, x2, y2, c2, ...] as produced by compress_keypoints(),
+                     or None for frames where this person/part is absent.
+    seam_weight    : optional (N,) float array from _compute_seam_weight().
+                     When provided, keypoints are additionally blended toward a
+                     heavily-smoothed version (stabilize_sigma) at seam frames,
+                     easing in and out via the bell-curve weights.
+    stabilize_sigma: Gaussian sigma for the heavy stabilization pass.
+
+    Returns        : list of N items in the same flat-float format, x/y smoothed.
+                     Confidence values and undetected keypoints are preserved unchanged.
     """
     n_frames = len(kps_frames)
     if n_frames < 2:
@@ -159,6 +202,9 @@ def _smooth_keypoints(kps_frames, method, sigma, window_size, alpha, min_cutoff,
 
     smoothed = coords.copy()
 
+    # Expand seam_weight for (x, y) broadcasting: (N,) → (N, 1)
+    sw = seam_weight[:, np.newaxis] if seam_weight is not None else None
+
     for k in range(n_kps):
         mask = conf[:, k] > 0
         if mask.sum() < 2:
@@ -167,6 +213,7 @@ def _smooth_keypoints(kps_frames, method, sigma, window_size, alpha, min_cutoff,
         # Fill detection gaps via linear interpolation before smoothing
         filled = _interpolate_gaps(coords[:, k, :], mask)
 
+        # Regular smoothing pass
         if method == "gaussian":
             result = _smooth_gaussian(filled, sigma)
         elif method == "moving_average":
@@ -177,6 +224,13 @@ def _smooth_keypoints(kps_frames, method, sigma, window_size, alpha, min_cutoff,
             result = _smooth_one_euro(filled, fps, min_cutoff, beta)
         else:
             result = filled
+
+        # Seam stabilization: blend toward a heavily-smoothed version using
+        # the bell-curve weights — maximum stabilization at the seam center,
+        # easing naturally in and out on either side.
+        if sw is not None:
+            heavy = _smooth_gaussian(filled, stabilize_sigma)
+            result = (1.0 - sw) * result + sw * heavy
 
         # Only write back to frames that originally had this keypoint detected
         smoothed[mask, k] = result[mask]
@@ -221,6 +275,12 @@ class PoseKeypointSmoother:
     Only detected keypoints (confidence > 0) are updated. Gaps are filled by
     linear interpolation before smoothing, then undetected frames are restored
     to their original values so downstream rendering nodes still skip them.
+
+    Seam stabilization: when enabled, applies extra smoothing around the frame
+    window boundary frames produced by InfiniteTalk's multi-window generation.
+    The additional smoothing follows a Gaussian bell curve centred on each seam,
+    so the pose eases into a more stable state approaching the boundary and eases
+    back out naturally — no sudden freeze or unfreeze.
 
     Coordinate format expected: POSE_KEYPOINT as produced by DWPose / OpenPose
     preprocessors in comfyui_controlnet_aux.
@@ -282,6 +342,46 @@ class PoseKeypointSmoother:
                 "render_body": ("BOOLEAN", {"default": True}),
                 "render_face": ("BOOLEAN", {"default": True}),
                 "render_hands": ("BOOLEAN", {"default": True}),
+                # --- Seam stabilization ---
+                "seam_stabilize": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Apply extra smoothing around InfiniteTalk frame-window seams to reduce pose jumps at window boundaries.",
+                }),
+                "seam_frame_window_size": ("INT", {
+                    "default": 145,
+                    "min": 1,
+                    "max": 10000,
+                    "step": 1,
+                    "tooltip": "[seam_stabilize] Connect to frame_window_size output of Optimal Frame Window Calculator.",
+                }),
+                "seam_motion_frame": ("INT", {
+                    "default": 16,
+                    "min": 1,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "[seam_stabilize] Connect to your motion_frame value (same as fed into the InfiniteTalk sampler). Used to compute window stride.",
+                }),
+                "stabilize_sigma": ("FLOAT", {
+                    "default": 8.0,
+                    "min": 0.5,
+                    "max": 50.0,
+                    "step": 0.5,
+                    "tooltip": "[seam_stabilize] Gaussian sigma for heavy smoothing applied at the seam. Higher = pose held more rigidly at the boundary.",
+                }),
+                "stabilize_radius": ("FLOAT", {
+                    "default": 8.0,
+                    "min": 1.0,
+                    "max": 60.0,
+                    "step": 0.5,
+                    "tooltip": "[seam_stabilize] How many frames the stabilization spreads from the seam centre (std dev of bell curve). Controls ease-in/out width.",
+                }),
+                "stabilize_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "[seam_stabilize] Peak blend weight at the seam centre. 1.0 = fully stabilized; 0.5 = half normal, half stabilized.",
+                }),
             }
         }
 
@@ -306,11 +406,37 @@ class PoseKeypointSmoother:
         render_body,
         render_face,
         render_hands,
+        seam_stabilize,
+        seam_frame_window_size,
+        seam_motion_frame,
+        stabilize_sigma,
+        stabilize_radius,
+        stabilize_strength,
     ):
         n_frames = len(pose_keypoint)
         if n_frames < 2:
             print("[PoseKeypointSmoother] Less than 2 frames — nothing to smooth.")
             return (pose_keypoint,)
+
+        # Build seam weight array if stabilization is requested
+        seam_weight = None
+        if seam_stabilize:
+            seam_weight = _compute_seam_weight(
+                n_frames, seam_frame_window_size, seam_motion_frame,
+                stabilize_radius, stabilize_strength,
+            )
+            if seam_weight is not None:
+                n_seams = int((n_frames - seam_frame_window_size) //
+                              max(1, seam_frame_window_size - seam_motion_frame)) + 1
+                n_seams = max(1, n_seams) if seam_frame_window_size < n_frames else 0
+                seam_peak = float(seam_weight.max())
+                print(
+                    f"[PoseKeypointSmoother] Seam stabilization ON | "
+                    f"window={seam_frame_window_size} motion={seam_motion_frame} "
+                    f"stride={seam_frame_window_size - seam_motion_frame} | "
+                    f"stabilize_sigma={stabilize_sigma} radius={stabilize_radius} "
+                    f"strength={stabilize_strength} | peak_weight={seam_peak:.3f}"
+                )
 
         # Deep copy so we never mutate the upstream node's output
         result = copy.deepcopy(pose_keypoint)
@@ -327,7 +453,8 @@ class PoseKeypointSmoother:
                     for f in result
                 ]
                 smoothed = _smooth_keypoints(
-                    animal_kps, method, sigma, window_size, alpha, min_cutoff, beta, fps
+                    animal_kps, method, sigma, window_size, alpha, min_cutoff, beta, fps,
+                    seam_weight=seam_weight, stabilize_sigma=stabilize_sigma,
                 )
                 for f_idx, frame in enumerate(result):
                     if frame.get("animals") and animal_idx < len(frame["animals"]) and smoothed[f_idx] is not None:
@@ -354,7 +481,8 @@ class PoseKeypointSmoother:
                         for f in result
                     ]
                     smoothed = _smooth_keypoints(
-                        part_kps, method, sigma, window_size, alpha, min_cutoff, beta, fps
+                        part_kps, method, sigma, window_size, alpha, min_cutoff, beta, fps,
+                        seam_weight=seam_weight, stabilize_sigma=stabilize_sigma,
                     )
                     for f_idx, frame in enumerate(result):
                         if (
