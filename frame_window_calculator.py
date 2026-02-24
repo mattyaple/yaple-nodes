@@ -34,7 +34,14 @@ class OptimalFrameWindowCalculator:
                     "default": 0,
                     "min": 0,
                     "max": 20,
-                    "tooltip": "0 = auto (minimize windows, max size 181). >0 = target exactly this many windows with no size upper limit (experimental, may OOM)"
+                    "tooltip": "0 = auto (minimize windows, respect max_frame_window_size). >0 = target exactly this many windows with no size upper limit (experimental, may OOM)"
+                }),
+                "max_frame_window_size": ("INT", {
+                    "default": 181,
+                    "min": 81,
+                    "max": 500,
+                    "step": 4,
+                    "tooltip": "Upper limit for frame window size in auto mode (target_windows=0). Default 181 is safe for most GPUs. Increase cautiously — larger windows use significantly more VRAM."
                 }),
             }
         }
@@ -44,7 +51,7 @@ class OptimalFrameWindowCalculator:
     FUNCTION = "calculate"
     CATEGORY = "infinitetalk/utils"
 
-    def calculate(self, audio, fps, motion_frame, target_windows):
+    def calculate(self, audio, fps, motion_frame, target_windows, max_frame_window_size):
         waveform = audio["waveform"]  # shape: (batch, channels, samples)
         sample_rate = audio["sample_rate"]
         num_samples = waveform.shape[-1]
@@ -54,8 +61,8 @@ class OptimalFrameWindowCalculator:
         total_frames = int(duration * fps)
 
         if target_windows == 0:
-            # Normal mode: cap at 181 (safe for H100)
-            valid_sizes = list(range(81, 182, 4))
+            # Normal mode: cap at max_frame_window_size
+            valid_sizes = list(range(81, max_frame_window_size + 1, 4))
         else:
             # Experimental mode: no upper limit — generate sizes up to the minimum
             # needed to fit total_frames in a single window (size >= total_frames)
@@ -105,6 +112,8 @@ class OptimalFrameWindowCalculator:
         print(f"[FrameWindowCalc] motion_frame={motion_frame}, stride={best_size - motion_frame}")
         if target_windows > 0:
             print(f"[FrameWindowCalc] Target windows: {target_windows} (experimental)")
+        else:
+            print(f"[FrameWindowCalc] Max frame window size: {max_frame_window_size}")
         print(f"[FrameWindowCalc] Best window size: {best_size} | Windows: {best_n} | Padding: {best_padding} frames")
 
         return (best_size, total_frames, best_n, best_padding)
