@@ -41,7 +41,7 @@ class OptimalFrameWindowCalculator:
                     "min": 81,
                     "max": 500,
                     "step": 4,
-                    "tooltip": "Upper limit for frame window size in auto mode (target_windows=0). Default 181 is safe for most GPUs. Increase cautiously — larger windows use significantly more VRAM."
+                    "tooltip": "Upper limit for frame window size in auto mode (target_windows=0). Default 181 is tuned for H100 (80GB VRAM). Lower this on GPUs with less VRAM — 81 is a safe starting point for less powerful GPUs. Larger windows use significantly more VRAM."
                 }),
             }
         }
