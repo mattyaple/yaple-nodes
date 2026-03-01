@@ -33,6 +33,10 @@ class AutoSwitch:
                 "a": (any_type,),
                 "b": (any_type,),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
         }
 
     RETURN_TYPES = (any_type,)
@@ -40,16 +44,36 @@ class AutoSwitch:
     FUNCTION = "switch"
     CATEGORY = "yaple/utils"
 
-    def switch(self, select_b, a=None, b=None):
+    def _node_label(self, unique_id, extra_pnginfo):
+        """Return the user-assigned node title, falling back to 'AutoSwitch'."""
+        try:
+            nodes = (extra_pnginfo or {}).get("workflow", {}).get("nodes", [])
+            for node in nodes:
+                if str(node.get("id")) == str(unique_id):
+                    return node.get("title") or "AutoSwitch"
+        except Exception:
+            pass
+        return "AutoSwitch"
+
+    def switch(self, select_b, unique_id=None, extra_pnginfo=None, a=None, b=None):
+        label = self._node_label(unique_id, extra_pnginfo)
         a_active = a is not None
         b_active = b is not None
 
         if a_active and not b_active:
+            print(f"[{label}] Auto-selected A (B is inactive)")
             return (a,)
         if b_active and not a_active:
+            print(f"[{label}] Auto-selected B (A is inactive)")
             return (b,)
 
-        # Both active or neither active — fall back to the boolean toggle
+        if not a_active and not b_active:
+            print(f"[{label}] WARNING: Both inputs inactive — returning None")
+            return (None,)
+
+        # Both active — use the boolean toggle
+        chosen = "B" if select_b else "A"
+        print(f"[{label}] Both inputs active — toggle selected {chosen}")
         return (b,) if select_b else (a,)
 
 
