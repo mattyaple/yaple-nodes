@@ -75,7 +75,10 @@ async def _get_image_from_response(response: GeminiGenerateContentResponse) -> t
             img = await download_url_to_image_tensor(part.fileData.fileUri)
         image_tensors.append(img)
     if not image_tensors:
-        return torch.zeros((1, 1024, 1024, 4))
+        refusal_text = get_text_from_response(response)
+        raise ValueError(
+            f"Gemini returned no image. Model response: {refusal_text!r}"
+        )
     if len(image_tensors) == 1:
         return image_tensors[0]
     # If parts differ in size, keep only the highest-resolution one.
@@ -382,12 +385,151 @@ class NanoBanana2Batch(IO.ComfyNode):
         return IO.NodeOutput(torch.cat(_resize_to_match(image_tensors), dim=0), "\n---\n".join(texts))
 
 
+class NanoBananaProBatch(IO.ComfyNode):
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="NanoBananaProBatch",
+            display_name="Nano Banana Pro Batch",
+            category="api node/image/Gemini",
+            description=(
+                "Generate a batch of images with Nano Banana Pro (Gemini 3 Pro Image) in a single run. "
+                "All batch_size requests are fired concurrently so total time ≈ one image. "
+                "Cost = batch_size × per-image price. "
+                "Note: this model does not support thinking_level."
+            ),
+            inputs=[
+                IO.String.Input(
+                    "prompt",
+                    multiline=True,
+                    tooltip="Text prompt describing the image to generate or edits to apply.",
+                    default="",
+                ),
+                IO.Int.Input(
+                    "batch_size",
+                    default=4,
+                    min=1,
+                    max=8,
+                    tooltip="Number of images to generate concurrently per run. If the API returns varying resolutions across calls, all images are resized to match the first result.",
+                ),
+                IO.Int.Input(
+                    "seed",
+                    default=42,
+                    min=0,
+                    max=0xFFFFFFFFFFFFFFFF,
+                    control_after_generate=True,
+                    tooltip="Base seed. Each image in the batch uses seed+i for variety.",
+                ),
+                IO.Combo.Input(
+                    "aspect_ratio",
+                    options=["auto", "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+                    default="auto",
+                ),
+                IO.Combo.Input(
+                    "resolution",
+                    options=["1K", "2K", "4K"],
+                    tooltip="Target output resolution. For 2K/4K the native Gemini upscaler is used.",
+                ),
+                IO.Combo.Input(
+                    "response_modalities",
+                    options=["IMAGE+TEXT", "IMAGE"],
+                    advanced=True,
+                ),
+                IO.Image.Input(
+                    "images",
+                    optional=True,
+                    tooltip="Optional reference image(s). Uploaded once and shared across all batch calls.",
+                ),
+                IO.Custom("GEMINI_INPUT_FILES").Input(
+                    "files",
+                    optional=True,
+                ),
+                IO.String.Input(
+                    "system_prompt",
+                    multiline=True,
+                    default=GEMINI_IMAGE_SYS_PROMPT,
+                    optional=True,
+                    advanced=True,
+                ),
+            ],
+            outputs=[
+                IO.Image.Output(),
+                IO.String.Output(),
+            ],
+            hidden=[
+                IO.Hidden.auth_token_comfy_org,
+                IO.Hidden.api_key_comfy_org,
+                IO.Hidden.unique_id,
+            ],
+            is_api_node=True,
+            price_badge=IO.PriceBadge(
+                expr="""{"type":"usd","usd":0.039,"format":{"suffix":"/Image (1K) × batch_size","approximate":true}}""",
+            ),
+        )
+
+    @classmethod
+    async def execute(
+        cls,
+        prompt: str,
+        batch_size: int,
+        seed: int,
+        aspect_ratio: str,
+        resolution: str,
+        response_modalities: str,
+        images: Input.Image | None = None,
+        files: list[GeminiPart] | None = None,
+        system_prompt: str = "",
+    ) -> IO.NodeOutput:
+        validate_string(prompt, strip_whitespace=True, min_length=1)
+
+        model = "gemini-3-pro-image-preview"
+
+        base_parts: list[GeminiPart] = [GeminiPart(text=prompt)]
+        if images is not None:
+            if get_number_of_images(images) > 14:
+                raise ValueError("The current maximum number of supported images is 14.")
+            base_parts.extend(await create_image_parts(cls, images))
+        if files is not None:
+            base_parts.extend(files)
+
+        image_config = GeminiImageConfig(imageSize=resolution)
+        if aspect_ratio != "auto":
+            image_config.aspectRatio = aspect_ratio
+
+        gen_config = GeminiImageGenerationConfig(
+            responseModalities=(["IMAGE"] if response_modalities == "IMAGE" else ["TEXT", "IMAGE"]),
+            imageConfig=image_config,
+        )
+
+        gemini_system_prompt = None
+        if system_prompt:
+            gemini_system_prompt = GeminiSystemInstructionContent(
+                parts=[GeminiTextPart(text=system_prompt)], role=None
+            )
+
+        responses = await asyncio.gather(*[
+            _single_call(cls, model, base_parts, gen_config, gemini_system_prompt)
+            for _ in range(batch_size)
+        ])
+
+        image_tensors = []
+        texts = []
+        for response in responses:
+            image_tensors.append(await _get_image_from_response(response))
+            texts.append(get_text_from_response(response))
+
+        return IO.NodeOutput(torch.cat(_resize_to_match(image_tensors), dim=0), "\n---\n".join(texts))
+
+
 NODE_CLASS_MAPPINGS = {
     "NanoBananaBatch": NanoBananaBatch,
     "NanoBanana2Batch": NanoBanana2Batch,
+    "NanoBananaProBatch": NanoBananaProBatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NanoBananaBatch": "Nano Banana Batch",
     "NanoBanana2Batch": "Nano Banana 2 Batch",
+    "NanoBananaProBatch": "Nano Banana Pro Batch",
 }
