@@ -153,8 +153,45 @@ Same concurrent-batch pattern as Nano Banana Batch but targets **Nano Banana 2**
 
 ---
 
+### Video Batch Loader
+`yaple/video`
+
+Loads a single video from a directory, selected by index. When `auto_increment` is enabled, each queue run automatically advances to the next video in the sorted list — queue the workflow N times to process all N videos in the folder without manual intervention.
+
+**Inputs:** `directory`, `index`, `auto_increment`, `force_rate`, `custom_width`, `custom_height`, `frame_load_cap`, `skip_first_frames`, `select_every_nth`, `meta_batch` (optional), `vae` (optional), `format` (optional)
+**Outputs:** `IMAGE`, `frame_count`, `audio`, `video_info`, `filename` (STRING)
+
+**Notes:**
+- Videos are sorted with natural ordering (so `clip_2` comes before `clip_10`).
+- Setting the `index` widget manually resets the sequence to that position on the next run.
+- `index` wraps around when it exceeds the number of files in the directory.
+- Output types are fully compatible with Video Helper Suite downstream nodes.
+
+**Requirements:** [comfyui-videohelpersuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) must be installed.
+
+---
+
+### Filename Formatter
+`yaple/utils`
+
+Formats a filename string for use as an output video name. Designed to pair with Video Batch Loader to derive a clean output filename from each input filename automatically.
+
+**Processing order:**
+1. Strip file extension
+2. Strip trailing numbered suffix (e.g. `_00001`, `-042`) — useful when input files are numbered sequences
+3. Find / replace (plain text)
+4. Prepend prefix and/or append suffix
+
+**Inputs:** `filename` (STRING, wire only), `strip_numbered_suffix`, `find`, `replace`, `prefix`, `suffix`
+**Outputs:** `text` (STRING)
+
+**Example:** `S2-40_00001.mp4` → strip suffix → `S2-40` → prefix `out_` → `out_S2-40`
+
+---
+
 ## Requirements
 
 - [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
 - [comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux) (required by Pose Keypoint Smoother for rendering)
 - [comfyui-frame-interpolation](https://github.com/Fannovel16/ComfyUI-Frame-Interpolation) (required by Video Seam RIFE only)
+- [comfyui-videohelpersuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) (required by Video Batch Loader)
